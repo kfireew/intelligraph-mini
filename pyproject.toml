@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "intelligraph-mini"
+version = "0.1.0"
+description = "Local-first MCP graph intelligence server — RRF hybrid search, multi-hop traversal, source snippets"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0",
+    "graphifyy>=0.9.4",
+    "code-review-graph>=2.3",
+    "sentence-transformers>=2.2",
+    "numpy>=1.24",
+    "networkx>=3.0",
+]
+
+[project.scripts]
+intelligraph-mini = "intelligraph_mini.server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+intelligraph_mini = ["models/all-MiniLM-L6-v2/*"]
