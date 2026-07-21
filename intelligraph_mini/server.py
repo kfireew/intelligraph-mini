@@ -225,6 +225,34 @@ def _log_call(tool, result_count, est_tokens):
     print(f"[intelligraph-mini] {tool}#{cid} -> {result_count} results, ~{est_tokens} tokens | session: {stats_summary}, total_tokens~{_SESSION_STATS['est_tokens']}", file=sys.stderr)
 
 
+_SUFFICIENCY_TEXT = {
+    "HIGH": (
+        "Search confidence: HIGH\n"
+        "These results include signatures, representative source snippets, and graph relationships. "
+        "They are typically sufficient for architectural, navigation, and high-level code understanding. "
+        "Open source files only if you need implementation details that are not present here."
+    ),
+    "MEDIUM": (
+        "Search confidence: MEDIUM\n"
+        "These results include partial signatures, snippets, and some graph relationships. "
+        "They are typically sufficient for navigation and identifying relevant symbols, "
+        "but implementation details may be incomplete. Open source files if you need fuller "
+        "context around a specific function or its callers."
+    ),
+    "LOW": (
+        "Search confidence: LOW\n"
+        "These results are best-effort matches based on weak semantic similarity or fuzzy keyword hits. "
+        "They identify candidate symbols but may not directly answer the question. "
+        "Open source files to confirm relevance, or call node() on a specific symbol to explore its neighborhood."
+    ),
+    "NONE": (
+        "Search confidence: NONE\n"
+        "No symbols matched the query. Try rephrasing with a more specific symbol name, "
+        "or open source files directly if you know the file path."
+    ),
+}
+
+
 def _dispatch(name, args):
     provider = _get_provider()
     if not provider:
@@ -235,12 +263,15 @@ def _dispatch(name, args):
         results = provider.hybrid_search(query, max_results=10, embedding_weight=0.4)
         if not results:
             _log_call("search", 0, 0)
-            return f"No results for '{query}'."
+            return _SUFFICIENCY_TEXT["NONE"] + f"\n\nNo results for '{query}'."
         # Fetch snippets for top 5 results so LLM gets context without reading files
         top_names = [r.get("name", "") for r in results[:5] if r.get("name")]
         snippets = provider.get_snippets(top_names, max_chars=250) if top_names else {}
         call_id = _SESSION_CALL_COUNTER[0] + 1
-        lines = [f"## Search: '{query}' ({len(results)} results)"]
+        # Sufficiency recommendation derived from top result's confidence
+        top_conf = results[0].get("confidence", "MEDIUM")
+        lines = [_SUFFICIENCY_TEXT.get(top_conf, _SUFFICIENCY_TEXT["MEDIUM"]), "",
+                 f"## Search: '{query}' ({len(results)} results)"]
         for i, r in enumerate(results[:10], 1):
             sym = r.get("name", "?")
             kind = r.get("kind", "")
