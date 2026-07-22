@@ -41,6 +41,22 @@ _JUNK_PATH_PATTERNS = [
     ".ngfactory.ts", "redux-dev-tools", "build-resources",
 ]
 
+_TEST_PATH_PATTERNS = [
+    "/test/", "/tests/", "/__tests__/", "/e2e/", "/e2e-tests/",
+    ".test.", ".spec.", ".e2e.", ".stories.",
+    "/fixtures/", "/mocks/", "/mock/", "/testdata/",
+    "test-helper", "test-utils", "test-setup",
+    "/cypress/", "/playwright/", "/jest/",
+]
+
+
+def _is_test_path(fp):
+    """Check if a file path looks like a test/spec/mock file."""
+    if not fp:
+        return True
+    lower = fp.lower() if isinstance(fp, str) else ""
+    return any(p in lower for p in _TEST_PATH_PATTERNS)
+
 
 def _is_junk_path(fp):
     if not fp:
@@ -125,7 +141,7 @@ class IntelligenceProvider:
         """Architecture overview (communities, modules, summaries)."""
         return []
 
-    def impact(self, target: str, max_depth: int = 2) -> list[dict]:
+    def impact(self, target: str) -> list[dict]:
         """Blast-radius analysis: callers, callees, dependents of target."""
         return []
 
@@ -194,13 +210,20 @@ class CRGProvider(IntelligenceProvider):
         return self._conn
 
     def _extract_repo_prefix(self) -> str:
-        """Extract the repo root prefix from CRG node paths.
+        """Extract the repo root prefix for path normalization.
 
-        CRG stores absolute paths like:
-          C:\\Users\\...\\repos\\local-2-xxx\\graphify\\cluster.py
-        We need to strip everything up to and including the repo root
-        to get repo-relative paths: graphify/cluster.py
+        Priority:
+        1. proj["repo_dir"] — known, absolute, correct (when mini runs with --repo-dir)
+        2. Common prefix from DB paths — fallback
         """
+        # 1. Known repo_dir — always correct, no guessing
+        repo_dir = self.proj.get("repo_dir")
+        if repo_dir:
+            prefix = repo_dir.replace("\\", "/").rstrip("/") + "/"
+            _vmsg("CRG INTELLIGENCE: repo prefix (from repo_dir) = %s", prefix)
+            return prefix
+
+        # 2. Fallback: common prefix from DB paths
         conn = self._conn
         try:
             rows = conn.execute(
@@ -212,38 +235,27 @@ class CRGProvider(IntelligenceProvider):
             if not paths:
                 return ""
             common = os.path.commonprefix(paths)
-            # Truncate to last / (don't include partial directory name)
             idx = common.rfind("/")
             if idx > 0:
                 prefix = common[:idx + 1]
-                # But common prefix might be too short if there are diverse paths.
-                # Find the repo root by looking for the first source code dir.
-                # e.g. prefix = .../repos/local-2-xxx/  → we want this
-                # If prefix is .../repos/  (too short), we need to go deeper.
-                # Check: does any path have the prefix + a single directory component
-                # that appears in MOST paths?
-                # Simpler: the prefix already works because commonprefix finds the
-                # longest shared start. For repos with diverse top-level dirs,
-                # this is the repo root.
-                _vmsg("CRG INTELLIGENCE: repo prefix = %s", prefix)
+                _vmsg("CRG INTELLIGENCE: repo prefix (from DB common) = %s", prefix)
                 return prefix
         except Exception as e:
             log.warning("CRG prefix extraction failed: %s", e)
         return ""
 
     def _normalize_path(self, abs_path: str) -> str:
-        """Convert CRG absolute path to repo-relative path."""
+        """Convert CRG absolute path to repo-relative path.
+
+        Strips the known repo prefix (from repo_dir or DB common prefix).
+        No folder-name guessing, no markers — just strips the prefix we know
+        is correct.
+        """
         if not abs_path:
             return ""
         p = abs_path.replace("\\", "/")
-        if self._repo_prefix and p.startswith(self._repo_prefix):
+        if self._repo_prefix and p.lower().startswith(self._repo_prefix.lower()):
             return p[len(self._repo_prefix):]
-        # Fallback: try to find the last occurrence of a known source dir
-        # This handles cases where the prefix extraction was imperfect
-        for marker in ("graphify/", "src/", "lib/", "tests/", "backend/"):
-            idx = p.find("/" + marker)
-            if idx >= 0:
-                return p[idx + 1:]
         return p
 
     @staticmethod
@@ -285,10 +297,11 @@ class CRGProvider(IntelligenceProvider):
         raw_tokens = re.split(r"[\s\-./]+", lower)
 
         # Individual meaningful words
+        # Allow underscores in identifiers (hybrid_search, _vmsg, etc.)
         words = []
         for token in raw_tokens:
             token = token.strip()
-            if len(token) > 2 and token.isalpha() and token not in stopwords:
+            if len(token) > 2 and token.replace("_", "").isalpha() and token not in stopwords:
                 words.append(token)
 
         # Also try multi-word compound: "build_graph" from "build graph"
@@ -297,7 +310,7 @@ class CRGProvider(IntelligenceProvider):
         current_compound = []
         for token in raw_tokens:
             token = token.strip()
-            if token and len(token) > 2 and token not in stopwords and token.isalpha():
+            if token and len(token) > 2 and token not in stopwords and token.replace("_", "").isalpha():
                 current_compound.append(token)
             else:
                 if len(current_compound) > 1:
@@ -306,8 +319,9 @@ class CRGProvider(IntelligenceProvider):
         if len(current_compound) > 1:
             compounds.append("_".join(current_compound))
 
-        # Return compounds first (more specific), then individual words
-        return compounds + words
+        # Return compounds first (more specific), then individual words.
+        # If nothing extracted (e.g. all stopwords), fall back to the raw query.
+        terms = compounds + words
         return terms or [query.lower().strip()]
 
     # ── Mode 0: Target extraction ──────────────────────────────────
@@ -384,19 +398,69 @@ class CRGProvider(IntelligenceProvider):
     def search(self, query: str, max_results: int = 20) -> list[dict]:
         """FTS5 search for symbols/files matching the query.
 
-        Returns: [{file_path, name, kind, signature, community_id, score, reason, source, mode}]
+        A LIKE pre-pass catches camelCase / concatenated names that FTS
+        tokenization misses (e.g. "zik plane" -> "ZikPlane"). FTS then adds
+        tokenized matches. Results carry line_start/line_end so callers
+        (MCP) can give the agent surgical read ranges instead of whole files.
+
+        Returns: [{file_path, name, kind, signature, line_start, line_end,
+                   community_id, score, exact_match, matched_terms, reason, source, mode}]
         """
         conn = self._get_conn()
         terms = self._extract_terms(query)
         if not terms:
             return []
 
-        file_scores = defaultdict(lambda: {"score": 0.0, "names": [], "kinds": set(), "matched_terms": set(), "signatures": [], "exact_match": False})
+        file_scores = defaultdict(lambda: {"score": 0.0, "names": [], "kinds": set(),
+                                           "matched_terms": set(), "signatures": [],
+                                           "exact_match": False,
+                                           "line_start": 0, "line_end": 0})
+
+        # Pass 0: LIKE pre-pass — catches camelCase / concatenated / underscore names.
+        # "zik plane" -> "zikplane" -> matches "ZikPlane"
+        # "hybrid_search" -> tries both "hybrid_search" AND "hybridsearch"
+        for term in terms:
+            like_term = term.replace(" ", "").replace("_", "")
+            for try_term in [term, like_term]:
+                if len(try_term) < 3:
+                    continue
+                try:
+                    rows = conn.execute(
+                        "SELECT name, kind, file_path, signature, community_id, "
+                        "line_start, line_end FROM nodes "
+                        "WHERE kind IN ('Function','Class','Method') "
+                        "AND LOWER(name) LIKE ? "
+                        "ORDER BY LENGTH(name) ASC LIMIT 10",
+                        (f"%{try_term}%",)
+                    ).fetchall()
+                    for r in rows:
+                        fp = self._normalize_path(r["file_path"])
+                        if not fp or _is_junk_path(fp) or _is_test_path(fp):
+                            continue
+                        is_exact = r["name"].lower() == try_term
+                        entry = file_scores[fp]
+                        entry["score"] += (15.0 if is_exact else 8.0)
+                        entry["names"].append(r["name"])
+                        entry["kinds"].add(r["kind"])
+                        entry["matched_terms"].add(term)
+                        if r["signature"]:
+                            entry["signatures"].append(r["signature"])
+                        if is_exact:
+                            entry["exact_match"] = True
+                        if r["line_start"]:
+                            entry["line_start"] = r["line_start"]
+                        if r["line_end"]:
+                            entry["line_end"] = r["line_end"]
+                except Exception:
+                    pass
+
+        # Pass 1: FTS5 search
         for i, term in enumerate(terms):
-            weight = 5.0 if i < 3 else 3.0  # earlier terms weighted higher
+            weight = 5.0 if i < 3 else 3.0
             try:
                 rows = conn.execute(
-                    "SELECT n.file_path, n.name, n.kind, n.signature, n.community_id "
+                    "SELECT n.file_path, n.name, n.kind, n.signature, n.community_id, "
+                    "n.line_start, n.line_end "
                     "FROM nodes_fts f JOIN nodes n ON f.rowid = n.id "
                     "WHERE nodes_fts MATCH ? ORDER BY rank LIMIT ?",
                     (f'"{term}"', 15)
@@ -405,7 +469,6 @@ class CRGProvider(IntelligenceProvider):
                     fp = self._normalize_path(r["file_path"])
                     if not fp or _is_junk_path(fp):
                         continue
-                    # Exact match boost: if the symbol name exactly matches the term
                     is_exact = r["name"].lower() == term.lower()
                     entry = file_scores[fp]
                     entry["score"] += (15.0 if is_exact else weight)
@@ -416,6 +479,10 @@ class CRGProvider(IntelligenceProvider):
                         entry["signatures"].append(r["signature"])
                     if is_exact:
                         entry["exact_match"] = True
+                    if r["line_start"]:
+                        entry["line_start"] = r["line_start"]
+                    if r["line_end"]:
+                        entry["line_end"] = r["line_end"]
             except Exception as e:
                 log.warning("CRG FTS search for '%s' failed: %s", term, e)
 
@@ -432,6 +499,8 @@ class CRGProvider(IntelligenceProvider):
                 "name": data["names"][0] if data["names"] else "",
                 "kind": list(data["kinds"])[0] if data["kinds"] else "",
                 "signature": data["signatures"][0] if data["signatures"] else "",
+                "line_start": data["line_start"],
+                "line_end": data["line_end"],
                 "exact_match": data["exact_match"],
                 "matched_terms": sorted(data["matched_terms"]),
                 "reason": ["crg_fts_match"],
@@ -462,13 +531,15 @@ class CRGProvider(IntelligenceProvider):
         conn = self._get_conn()
         try:
             rows = conn.execute(
-                "SELECT id, name, kind, signature, file_path, qualified_name "
+                "SELECT id, name, kind, signature, file_path, qualified_name, "
+                "line_start, line_end "
                 "FROM nodes WHERE name IS NOT NULL AND kind IN ('Function','Class','Method','File') "
                 "ORDER BY id"
             ).fetchall()
         except Exception:
             rows = conn.execute(
-                "SELECT id, name, '' as kind, '' as signature, file_path, '' as qualified_name "
+                "SELECT id, name, '' as kind, '' as signature, file_path, '' as qualified_name, "
+                "line_start, line_end "
                 "FROM nodes WHERE name IS NOT NULL ORDER BY id"
             ).fetchall()
 
@@ -492,6 +563,8 @@ class CRGProvider(IntelligenceProvider):
                 "file_path": self._normalize_path(r["file_path"]) if r["file_path"] else "",
                 "qualified_name": r["qualified_name"] or name,
                 "signature": r["signature"] or "",
+                "line_start": r["line_start"] or 0,
+                "line_end": r["line_end"] or 0,
             })
 
         if not texts:
@@ -554,6 +627,8 @@ class CRGProvider(IntelligenceProvider):
                 "name": m["name"],
                 "kind": m["kind"],
                 "signature": m.get("signature", ""),
+                "line_start": m.get("line_start", 0),
+                "line_end": m.get("line_end", 0),
                 "score": round(score, 3),
                 "reason": ["semantic_match"],
                 "source": "crg",
@@ -620,7 +695,7 @@ class CRGProvider(IntelligenceProvider):
                 sem_rank[fp] = i + 1
 
         # Build lookup MERGING both result lists (not overwriting) so that
-        # semantic_score, exact_match, signature, matched_terms all survive.
+        # semantic_score, exact_match, signature, matched_terms, line_start/end all survive.
         lookup = {}
         for r in sem_results:
             fp = r.get("file_path", "")
@@ -632,6 +707,8 @@ class CRGProvider(IntelligenceProvider):
                     "signature": r.get("signature", ""),
                     "exact_match": False,
                     "matched_terms": [],
+                    "line_start": r.get("line_start", 0),
+                    "line_end": r.get("line_end", 0),
                 }
         for r in fts_results:
             fp = r.get("file_path", "")
@@ -644,12 +721,18 @@ class CRGProvider(IntelligenceProvider):
                         "signature": r.get("signature", ""),
                         "exact_match": False,
                         "matched_terms": [],
+                        "line_start": r.get("line_start", 0),
+                        "line_end": r.get("line_end", 0),
                     }
                 lookup[fp]["exact_match"] = r.get("exact_match", False)
                 lookup[fp]["matched_terms"] = r.get("matched_terms", [])
                 lookup[fp]["fts_score"] = r.get("score", 0)
                 if not lookup[fp].get("signature") and r.get("signature"):
                     lookup[fp]["signature"] = r.get("signature", "")
+                if r.get("line_start") and not lookup[fp].get("line_start"):
+                    lookup[fp]["line_start"] = r["line_start"]
+                if r.get("line_end") and not lookup[fp].get("line_end"):
+                    lookup[fp]["line_end"] = r["line_end"]
 
         all_fps = set(fts_rank.keys()) | set(sem_rank.keys())
         scored = []
@@ -794,13 +877,31 @@ class CRGProvider(IntelligenceProvider):
 
         target_lower = target.lower()
         start_qnames = []
+        # Pass 1: exact name match — prefer non-test, non-File nodes
         for nid, ninfo in node_lookup.items():
             if ninfo["name"].lower() == target_lower or (ninfo["qualified_name"] and target_lower in ninfo["qualified_name"].lower()):
-                start_qnames.append(ninfo["qualified_name"])
-                break
+                fp = ninfo.get("file_path", "")
+                if _is_junk_path(fp) or _is_test_path(fp):
+                    continue
+                if ninfo.get("kind") in ("Function", "Class", "Method"):
+                    start_qnames.append(ninfo["qualified_name"])
+                    break
+        # Pass 2: exact name match — accept any non-test node
+        if not start_qnames:
+            for nid, ninfo in node_lookup.items():
+                if ninfo["name"].lower() == target_lower or (ninfo["qualified_name"] and target_lower in ninfo["qualified_name"].lower()):
+                    fp = ninfo.get("file_path", "")
+                    if _is_junk_path(fp) or _is_test_path(fp):
+                        continue
+                    start_qnames.append(ninfo["qualified_name"])
+                    break
+        # Pass 3: substring match — non-test only
         if not start_qnames:
             for nid, ninfo in node_lookup.items():
                 if target_lower in ninfo["name"].lower():
+                    fp = ninfo.get("file_path", "")
+                    if _is_junk_path(fp) or _is_test_path(fp):
+                        continue
                     start_qnames.append(ninfo["qualified_name"])
                     break
 
@@ -1030,19 +1131,23 @@ class CRGProvider(IntelligenceProvider):
         _vmsg("CRG ARCHITECTURE: %d communities", len(results))
         return results
 
-    # ── Mode 3: Impact (blast-radius over CALLS edges) ─────────────
+    # ── Mode 3: Impact (exhaustive blast-radius over ALL edges) ────
 
-    def impact(self, target: str, max_depth: int = 2) -> list[dict]:
-        """BFS over CALLS/IMPORTS_FROM edges to find blast-radius files.
+    def impact(self, target: str) -> list[dict]:
+        """Exhaustive BFS over ALL edge types to find the complete blast radius.
 
-        Returns: [{file_path, score, depth, reason, edge_type, source, mode}]
+        This is a SAFETY operation, not context delivery. No caps, no token
+        budget, no depth limit. Traverses both CRG edges AND graphify
+        links until the frontier is empty. The graph is finite — BFS terminates.
+
+        Returns: [{file_path, depth, symbols, edge_types, sources, mode}]
         """
         if not target:
             return []
         conn = self._get_conn()
         target_lower = target.lower()
 
-        # Find target nodes by name match
+        # Find target nodes by name match (same logic as before)
         target_nodes = conn.execute(
             "SELECT id, name, qualified_name, file_path FROM nodes "
             "WHERE LOWER(name) = ? OR LOWER(qualified_name) LIKE ? "
@@ -1051,7 +1156,6 @@ class CRGProvider(IntelligenceProvider):
         ).fetchall()
 
         if not target_nodes:
-            # Try FTS fallback
             target_nodes = conn.execute(
                 "SELECT n.id, n.name, n.qualified_name, n.file_path "
                 "FROM nodes_fts f JOIN nodes n ON f.rowid = n.id "
@@ -1060,7 +1164,6 @@ class CRGProvider(IntelligenceProvider):
             ).fetchall()
 
         if not target_nodes:
-            # Try word-level search: extract significant words from target
             words = [w for w in re.split(r'[\s_\-\.]+', target_lower) if len(w) > 2 and w not in
                      ("the", "and", "for", "that", "this", "with", "from", "what", "break", "change",
                       "modify", "update", "function", "method", "class", "module", "file", "code")]
@@ -1076,7 +1179,6 @@ class CRGProvider(IntelligenceProvider):
                         target_nodes.extend(rows)
                     except Exception:
                         pass
-                # Deduplicate by id
                 seen_ids = set()
                 deduped = []
                 for n in target_nodes:
@@ -1089,7 +1191,7 @@ class CRGProvider(IntelligenceProvider):
             _vmsg("CRG IMPACT: target '%s' not found", target)
             return []
 
-        # Collect qualified names of target nodes
+        # Collect target info
         target_qnames = set()
         target_files = set()
         for n in target_nodes:
@@ -1098,86 +1200,155 @@ class CRGProvider(IntelligenceProvider):
             if n["file_path"]:
                 target_files.add(self._normalize_path(n["file_path"]))
 
-        # BFS: for each target, find callers (who calls it) and callees (what it calls)
+        # BFS over CRG edges — ALL edge kinds, no filter, no cap, no depth limit.
+        # This is a safety operation — traverse until frontier is empty.
+        # The graph is finite; BFS terminates.
         visited_qnames = set()
-        file_scores = defaultdict(lambda: {"score": 0.0, "depth": 99, "reasons": set(), "edge_types": set()})
+        file_data = defaultdict(lambda: {"depth": 99, "symbols": set(), "edge_types": set(), "sources": set()})
         frontier = set(target_qnames)
+        depth = 0
 
-        for depth in range(1, max_depth + 1):
-            if not frontier:
-                break
+        while frontier:
+            depth += 1
             next_frontier = set()
             for qname in frontier:
                 if qname in visited_qnames:
                     continue
                 visited_qnames.add(qname)
 
-                # Find callers (edges where target_qualified = this qname → source is the caller)
+                # Find ALL edges where this qname is the target (callers/dependents)
                 try:
                     callers = conn.execute(
                         "SELECT DISTINCT e.source_qualified, e.kind, n.file_path, n.name "
                         "FROM edges e "
                         "LEFT JOIN nodes n ON n.qualified_name = e.source_qualified "
-                        "WHERE e.target_qualified = ? AND e.kind IN ('CALLS', 'IMPORTS_FROM')",
+                        "WHERE e.target_qualified = ?",
                         (qname,)
                     ).fetchall()
                     for c in callers:
                         fp = self._normalize_path(c["file_path"]) if c["file_path"] else ""
-                        if fp:
-                            entry = file_scores[fp]
-                            entry["score"] = max(entry["score"], 10.0 - (depth - 1) * 3)
+                        if fp and not _is_junk_path(fp) and not _is_test_path(fp):
+                            entry = file_data[fp]
                             entry["depth"] = min(entry["depth"], depth)
-                            entry["reasons"].add("crg_caller" if c["kind"] == "CALLS" else "crg_importer")
-                            entry["edge_types"].add(c["kind"])
+                            if c["name"]:
+                                entry["symbols"].add(c["name"])
+                            entry["edge_types"].add(c["kind"] or "link")
+                            entry["sources"].add("crg")
                         if c["source_qualified"]:
                             next_frontier.add(c["source_qualified"])
                 except Exception as e:
                     log.warning("CRG impact callers query failed: %s", e)
 
-                # Find callees (edges where source_qualified = this qname → target is the callee)
+                # Find ALL edges where this qname is the source (callees/dependencies)
                 try:
                     callees = conn.execute(
                         "SELECT DISTINCT e.target_qualified, e.kind, n.file_path, n.name "
                         "FROM edges e "
                         "LEFT JOIN nodes n ON n.qualified_name = e.target_qualified "
-                        "WHERE e.source_qualified = ? AND e.kind IN ('CALLS', 'IMPORTS_FROM')",
+                        "WHERE e.source_qualified = ?",
                         (qname,)
                     ).fetchall()
                     for c in callees:
                         fp = self._normalize_path(c["file_path"]) if c["file_path"] else ""
-                        if fp:
-                            entry = file_scores[fp]
-                            entry["score"] = max(entry["score"], 8.0 - (depth - 1) * 2)
+                        if fp and not _is_junk_path(fp) and not _is_test_path(fp):
+                            entry = file_data[fp]
                             entry["depth"] = min(entry["depth"], depth)
-                            entry["reasons"].add("crg_callee" if c["kind"] == "CALLS" else "crg_imported")
-                            entry["edge_types"].add(c["kind"])
+                            if c["name"]:
+                                entry["symbols"].add(c["name"])
+                            entry["edge_types"].add(c["kind"] or "link")
+                            entry["sources"].add("crg")
                         if c["target_qualified"]:
                             next_frontier.add(c["target_qualified"])
                 except Exception as e:
                     log.warning("CRG impact callees query failed: %s", e)
 
-            # Limit frontier to avoid explosion
-            frontier = set(list(next_frontier)[:50])
+            frontier = next_frontier - visited_qnames
 
         # Add target files themselves (depth 0)
         for fp in target_files:
-            entry = file_scores[fp]
-            entry["score"] = max(entry["score"], 15.0)
-            entry["depth"] = 0
-            entry["reasons"].add("crg_target")
+            if fp and not _is_junk_path(fp):
+                entry = file_data[fp]
+                entry["depth"] = 0
+                entry["sources"].add("crg")
+
+        # BFS over graphify links — ALL link types, no depth limit
+        gf = self.proj.get("graphify_data")
+        if gf and target_qnames:
+            gf_nodes = gf.get("nodes", [])
+            gf_links = gf.get("links", [])
+            gf_node_lookup = {}
+            for n in gf_nodes:
+                nid = n.get("id") or n.get("label")
+                if nid:
+                    gf_node_lookup[nid] = n
+                    for key in (n.get("label"), n.get("qualified_name")):
+                        if key:
+                            gf_node_lookup[key] = n
+                            gf_node_lookup[key.lower()] = n
+
+            # Find graphify node IDs matching target qnames
+            gf_target_ids = set()
+            for qn in target_qnames:
+                n = gf_node_lookup.get(qn) or gf_node_lookup.get(qn.lower())
+                if n:
+                    nid = n.get("id") or n.get("label")
+                    if nid:
+                        gf_target_ids.add(nid)
+            # Also try by name
+            for n in gf_nodes:
+                label = (n.get("label") or "").lower()
+                if label and label == target_lower:
+                    nid = n.get("id") or n.get("label")
+                    if nid:
+                        gf_target_ids.add(nid)
+
+            if gf_target_ids:
+                gf_visited = set()
+                gf_frontier = set(gf_target_ids)
+                gf_depth = 0
+                while gf_frontier:
+                    gf_depth += 1
+                    gf_next = set()
+                    for nid in gf_frontier:
+                        if nid in gf_visited:
+                            continue
+                        gf_visited.add(nid)
+                        for l in gf_links:
+                            src = l.get("source") or l.get("from")
+                            tgt = l.get("target") or l.get("to")
+                            edge_type = l.get("type") or l.get("kind") or "link"
+                            connected_id = None
+                            if src == nid and tgt:
+                                connected_id = tgt
+                            elif tgt == nid and src:
+                                connected_id = src
+                            if connected_id and connected_id not in gf_visited:
+                                gf_next.add(connected_id)
+                                cn = gf_node_lookup.get(connected_id, {})
+                                fp = cn.get("source_file", "")
+                                if fp:
+                                    fp_norm = self._normalize_path(fp)
+                                    if fp_norm and not _is_junk_path(fp_norm) and not _is_test_path(fp_norm):
+                                        entry = file_data[fp_norm]
+                                        entry["depth"] = min(entry["depth"], gf_depth)
+                                        if cn.get("label"):
+                                            entry["symbols"].add(cn["label"])
+                                        entry["edge_types"].add(edge_type)
+                                        entry["sources"].add("graphify")
+                    gf_frontier = gf_next - gf_visited
 
         results = []
-        for fp, data in sorted(file_scores.items(), key=lambda x: -x[1]["score"]):
+        for fp, data in sorted(file_data.items(), key=lambda x: (x[1]["depth"], -len(x[1]["symbols"]))):
             results.append({
                 "file_path": fp,
-                "score": round(data["score"], 1),
                 "depth": data["depth"],
-                "reason": sorted(data["reasons"]),
+                "symbols": sorted(data["symbols"]),
                 "edge_types": sorted(data["edge_types"]),
+                "sources": sorted(data["sources"]),
                 "source": "crg",
                 "mode": "impact",
             })
-        _vmsg("CRG IMPACT: target='%s' -> %d files (depth=%d)", target[:40], len(results), max_depth)
+        _vmsg("CRG IMPACT: target='%s' -> %d files (exhaustive, %d hops)", target[:40], len(results), depth)
         return results
 
     # ── Mode 4: Execution flows ────────────────────────────────────

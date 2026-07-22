@@ -134,7 +134,7 @@ def _get_provider():
     if os.path.exists(gf_json):
         with open(gf_json) as f:
             graphify_data = json.load(f)
-    proj = {"crg_db_path": crg_db, "graphify_data": graphify_data, "id": 0}
+    proj = {"crg_db_path": crg_db, "graphify_data": graphify_data, "id": 0, "repo_dir": REPO_DIR}
     provider = CRGProvider(proj)
     if not provider.is_available():
         return None
@@ -161,19 +161,17 @@ def _read_local_file(path, max_bytes=15000):
 def _build_tools():
     return [
         types.Tool(name="search", description=(
-            "Search the codebase using RRF hybrid search (keyword FTS5 + semantic embeddings). "
-            "Returns relevant symbols WITH signatures, source snippets, and confidence levels "
-            "(HIGH/MEDIUM/LOW). Use this FIRST. Usually sufficient for 'what/where is X' "
-            "questions — no file read needed when confidence is HIGH. "
-            "Example: 'add entity' finds 'upsertEntity'."
+            "Search the codebase for symbols, files, or concepts. "
+            "Returns name, kind, file path with line ranges (file:start-end), and confidence [H/M/L]. "
+            "Use built-in Read with offset=line_start, limit=line_end-line_start to get source. "
+            "Use this FIRST — replaces grep and glob."
         ), inputSchema={"type": "object", "properties": {
             "query": {"type": "string"}
         }, "required": ["query"]}),
         types.Tool(name="node", description=(
-            "Get a symbol's details, multi-hop subgraph (2-hop), 500-char source snippets for "
-            "top 5 neighbors, and rationale notes. Use AFTER search. Snippets are usually "
-            "sufficient — only read full files if you need implementation details beyond the "
-            "snippet. Each result includes role annotations (hub/leaf) to gauge importance."
+            "Get a symbol's connections (callers, callees, imports) with file:line ranges. "
+            "Use AFTER search. Then use built-in Read with those line ranges to get implementation details. "
+            "Replaces reading whole files — read only the specific line ranges shown."
         ), inputSchema={"type": "object", "properties": {
             "name": {"type": "string"}, "depth": {"type": "integer", "default": 2}
         }, "required": ["name"]}),
@@ -183,16 +181,16 @@ def _build_tools():
             "from": {"type": "string"}, "to": {"type": "string"}
         }, "required": ["from", "to"]}),
         types.Tool(name="impact", description=(
-            "Analyze blast-radius of changing a symbol. Traverses CALLS/IMPORTS_FROM edges. "
-            "Returns affected files with depth + score. Use to plan refactors or assess risk."
+            "Complete blast radius of changing a symbol. Exhaustive traversal of ALL edge types. "
+            "Returns every affected file with symbols to check. Use before refactoring. "
+            "Files not listed do not depend on the target."
         ), inputSchema={"type": "object", "properties": {
             "name": {"type": "string"}
         }, "required": ["name"]}),
         types.Tool(name="local_files", description=(
-            "Read raw source files from disk. EXPENSIVE (~1000-4000 tokens per file). "
-            "Use ONLY when search/node snippets are insufficient or search confidence is LOW. "
-            "If a file was already covered by a prior search/node result, this tool will note "
-            "what you already have before returning the content. Prefer 'node' for focused context."
+            "Read full source files from disk. EXPENSIVE. "
+            "Prefer built-in Read with line ranges from search/node results instead. "
+            "Use this only when you need a whole file that search/node didn't cover."
         ), inputSchema={"type": "object", "properties": {
             "paths": {"type": "array", "items": {"type": "string"}},
             "max_bytes": {"type": "integer", "default": 15000}
@@ -225,32 +223,8 @@ def _log_call(tool, result_count, est_tokens):
     print(f"[intelligraph-mini] {tool}#{cid} -> {result_count} results, ~{est_tokens} tokens | session: {stats_summary}, total_tokens~{_SESSION_STATS['est_tokens']}", file=sys.stderr)
 
 
-_SUFFICIENCY_TEXT = {
-    "HIGH": (
-        "Search confidence: HIGH\n"
-        "These results include signatures, representative source snippets, and graph relationships. "
-        "They are typically sufficient for architectural, navigation, and high-level code understanding. "
-        "Open source files only if you need implementation details that are not present here."
-    ),
-    "MEDIUM": (
-        "Search confidence: MEDIUM\n"
-        "These results include partial signatures, snippets, and some graph relationships. "
-        "They are typically sufficient for navigation and identifying relevant symbols, "
-        "but implementation details may be incomplete. Open source files if you need fuller "
-        "context around a specific function or its callers."
-    ),
-    "LOW": (
-        "Search confidence: LOW\n"
-        "These results are best-effort matches based on weak semantic similarity or fuzzy keyword hits. "
-        "They identify candidate symbols but may not directly answer the question. "
-        "Open source files to confirm relevance, or call node() on a specific symbol to explore its neighborhood."
-    ),
-    "NONE": (
-        "Search confidence: NONE\n"
-        "No symbols matched the query. Try rephrasing with a more specific symbol name, "
-        "or open source files directly if you know the file path."
-    ),
-}
+# ── Session search dedup cache ───────────────────────────────────
+_SESSION_SEARCHES = {}
 
 
 def _dispatch(name, args):
@@ -263,75 +237,87 @@ def _dispatch(name, args):
         results = provider.hybrid_search(query, max_results=10, embedding_weight=0.4)
         if not results:
             _log_call("search", 0, 0)
-            return _SUFFICIENCY_TEXT["NONE"] + f"\n\nNo results for '{query}'."
-        # Fetch snippets for top 5 results so LLM gets context without reading files
-        top_names = [r.get("name", "") for r in results[:5] if r.get("name")]
-        snippets = provider.get_snippets(top_names, max_chars=250) if top_names else {}
+            return f"No symbols found matching '{query}'."
+
+        # Dedup: same query in same session → cached one-liner
+        cache_key = query.lower().strip()
+        if cache_key in _SESSION_SEARCHES:
+            prev = _SESSION_SEARCHES[cache_key]
+            return f"[CACHED] Same as search#{prev['call_id']}. Files: {', '.join(prev['files'])}"
+
         call_id = _SESSION_CALL_COUNTER[0] + 1
-        # Sufficiency recommendation derived from top result's confidence
         top_conf = results[0].get("confidence", "MEDIUM")
-        lines = [_SUFFICIENCY_TEXT.get(top_conf, _SUFFICIENCY_TEXT["MEDIUM"]), "",
-                 f"## Search: '{query}' ({len(results)} results)"]
+        conf_tag = {"HIGH": "H", "MEDIUM": "M", "LOW": "L"}.get(top_conf, "M")
+
+        lines = [f'## "{query}" — {len(results)} results [{conf_tag}]']
+        files_list = []
+
         for i, r in enumerate(results[:10], 1):
-            sym = r.get("name", "?")
-            kind = r.get("kind", "")
-            fp = r.get("file_path", "")
-            conf = r.get("confidence", "MEDIUM")
-            reason = r.get("confidence_reason", "")
-            sig = r.get("signature", "")
-            snip_data = snippets.get(sym, {})
-            snippet = (snip_data.get("snippet", "") or "").strip()[:200]
-            lines.append(f"\n{i}. {sym} — `{fp}` [{kind}]")
-            lines.append(f"   confidence: {conf} ({reason})")
-            if sig:
-                lines.append(f"   signature: {sig[:150]}")
-            if snippet:
-                lines.append(f"   snippet: {snippet}")
-            _track_seen(fp, "search", call_id,
-                        snippet_chars=len(snippet),
-                        had_signature=bool(sig),
-                        had_relationships=False)
-        est_tokens = len(lines) * 25
+            rname = r.get("name", "?")
+            kind = r.get("kind", "?")
+            fp = r.get("file_path", "?")
+            ls = r.get("line_start", 0)
+            le = r.get("line_end", 0)
+            r_conf = r.get("confidence", "MEDIUM")
+            r_tag = {"HIGH": "H", "MEDIUM": "M", "LOW": "L"}.get(r_conf, "M")
+
+            if ls and le and le > ls:
+                loc = f"{fp}:{ls}-{le}"
+            elif ls:
+                loc = f"{fp}:{ls}"
+            else:
+                loc = fp
+            files_list.append(loc)
+            lines.append(f"{i}. {rname} ({kind}) {loc} [{r_tag}]")
+            _track_seen(fp, "search", call_id, had_signature=bool(r.get("signature")))
+
+        _SESSION_SEARCHES[cache_key] = {"call_id": call_id, "files": files_list}
+        est_tokens = sum(len(l) for l in lines) // 4
         _log_call("search", len(results), est_tokens)
         return "\n".join(lines)
 
     if name == "node":
         sym = args.get("name", "")
         depth = min(3, max(1, args.get("depth", 2)))
+        # Find the node via search, then traverse for connections
         results = provider.hybrid_search(sym, max_results=5, embedding_weight=0.4)
         target = results[0]["name"] if results else sym
-        trav = provider.traverse(target, max_hops=depth, max_nodes=20, max_tokens=300)
-        # 500-char snippets for top 5 nodes
-        node_names = [target] + [n["name"] for n in trav.get("nodes", [])[:5] if n["name"]]
-        snippets = provider.get_snippets(node_names, max_chars=500)
-        rationale = provider.get_rationale(target)
-        call_id = _SESSION_CALL_COUNTER[0] + 1
+        trav = provider.traverse(target, max_hops=depth, max_nodes=30, max_tokens=400)
 
-        lines = [f"## {target}"]
-        if trav.get("nodes"):
-            lines.append(f"\n### Subgraph ({depth} hops, {len(trav['nodes'])} nodes)")
-            for sn in trav["nodes"][:15]:
-                indent = "  " * sn.get("depth", 0)
-                arrow = "→ " if sn.get("depth", 0) > 0 else ""
-                degree = sn.get("degree", 0)
-                role = "hub" if degree >= 8 else ("connector" if degree >= 3 else "leaf")
-                lines.append(f"{indent}{arrow}{sn.get('name','?')} — `{sn.get('file','')}` [{role}: degree {degree}]")
-                _track_seen(sn.get("file", ""), "node", call_id,
-                            snippet_chars=500,
-                            had_signature=False,
-                            had_relationships=True)
-        if snippets:
-            lines.append("\n### Source Code")
-            for sn, sd in list(snippets.items())[:5]:
-                snip = (sd.get("snippet", "") or "").strip()[:500]
-                if snip:
-                    lines.append(f"\n```python\n# {sn}\n{snip}\n```")
-        if rationale:
-            lines.append("\n### Notes")
-            for rn in rationale[:5]:
-                lines.append(f"- {rn.get('text','')}")
-        est_tokens = len(lines) * 25
-        _log_call("node", len(trav.get("nodes", [])), est_tokens)
+        # Get line_start/line_end for target node
+        target_snips = provider.get_snippets([target], max_chars=1)
+        target_info = target_snips.get(target, {})
+        target_ls = target_info.get("line_start", 0)
+        target_le = target_info.get("line_end", 0)
+        target_fp = target_info.get("file_path", "")
+
+        call_id = _SESSION_CALL_COUNTER[0] + 1
+        loc = f"{target_fp}:{target_ls}-{target_le}" if target_ls and target_le else target_fp
+        lines = [f"## {target} {loc}", f"degree={len(trav.get('nodes', []))}"]
+
+        # Connections — from subgraph traversal, one line each with file:line range
+        trav_nodes = trav.get("nodes", [])
+        if trav_nodes:
+            # Get line ranges for all subgraph nodes
+            node_names = [n["name"] for n in trav_nodes if n.get("name")]
+            all_snips = provider.get_snippets(node_names, max_chars=1) if node_names else {}
+
+            lines.append("")
+            lines.append(f"### Connections ({len(trav_nodes)})")
+            for n in trav_nodes:
+                nname = n.get("name", "?")
+                nfile = n.get("file", "")
+                ndepth = n.get("depth", 0)
+                nsnip = all_snips.get(nname, {})
+                nls = nsnip.get("line_start", 0)
+                nle = nsnip.get("line_end", 0)
+                nloc = f"{nfile}:{nls}-{nle}" if nls and nle else (f"{nfile}:{nls}" if nls else nfile)
+                prefix = "<-" if ndepth > 0 else "->"
+                lines.append(f"  {prefix} {nname} {nloc}")
+                _track_seen(nfile, "node", call_id, had_relationships=True)
+
+        est_tokens = sum(len(l) for l in lines) // 4
+        _log_call("node", len(trav_nodes), est_tokens)
         return "\n".join(lines)
 
     if name == "path":
@@ -341,13 +327,26 @@ def _dispatch(name, args):
 
     if name == "impact":
         sym = args.get("name", "")
-        results = provider.impact(sym, max_depth=2)
-        _log_call("impact", len(results), len(results) * 10)
+        results = provider.impact(sym)
+        _log_call("impact", len(results), len(results) * 20)
         if not results:
             return f"No impact data for '{sym}'."
-        lines = [f"## Impact: '{sym}' ({len(results)} files)"]
-        for r in results[:15]:
-            lines.append(f"- `{r.get('file_path','')}` (depth={r.get('depth',0)}, score={r.get('score',0)})")
+        lines = [f"## Impact: '{sym}' ({len(results)} files — exhaustive)"]
+        lines.append("Files not listed here do not depend on the target in the code graph.")
+        lines.append("")
+        for r in results:
+            fp = r.get("file_path", "?")
+            depth = r.get("depth", 0)
+            symbols = r.get("symbols", [])
+            edge_types = r.get("edge_types", [])
+            sources = r.get("sources", [])
+            depth_label = "definition" if depth == 0 else f"depth {depth}"
+            src_label = "/".join(sources) if sources else "crg"
+            lines.append(f"- {fp} ({depth_label}, {src_label})")
+            if symbols:
+                lines.append(f"  symbols: {', '.join(symbols[:5])}")
+            if edge_types:
+                lines.append(f"  edges: {', '.join(edge_types[:5])}")
         return "\n".join(lines)
 
     if name == "local_files":
@@ -356,7 +355,6 @@ def _dispatch(name, args):
         lines = []
         total_bytes = 0
         for p in paths:
-            # Source-aware: inform LLM what it already has from prior search/node calls
             seen = _SESSION_SEEN.get(p)
             info_prefix = ""
             if seen:
